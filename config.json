@@ -1,32 +1,45 @@
 {
-    "name": "Mnist_LeNet",
-    "n_gpu": 1,
+    "name": "WaveNet_Mobility",
+    "n_gpu": 0,
 
     "arch": {
-        "type": "MnistModel",
-        "args": {}
+        "type": "WaveNetModel",
+        "args": {
+            "n_layers": 3,
+            "n_blocks": 2,
+            "n_dilation_channels": 32,
+            "n_residual_channels": 32,
+            "n_skip_channels": 256,
+            "n_end_channels": 2,
+            "n_classes": 2,
+            "output_length": 1,
+            "kernel_size": 2,
+            "bias": true
+        }
     },
     "data_loader": {
-        "type": "MnistDataLoader",
+        "type": "MobilityDataLoader",
         "args":{
-            "data_dir": "data/",
-            "batch_size": 128,
+            "data_dir": "data/wavenet_mobility.parquet",
+            "item_length": 14,
+            "target_length": 3,
+            "batch_size": 16,
             "shuffle": true,
             "validation_split": 0.1,
-            "num_workers": 2
+            "num_workers": 8
         }
     },
     "optimizer": {
         "type": "Adam",
         "args":{
             "lr": 0.001,
-            "weight_decay": 0,
+            "weight_decay": 1e-5,
             "amsgrad": true
         }
     },
-    "loss": "nll_loss",
+    "loss": "MSELoss",
     "metrics": [
-        "accuracy", "top_k_acc"
+        "rmse_loss", "haversine"
     ],
     "lr_scheduler": {
         "type": "StepLR",
@@ -36,14 +49,14 @@
         }
     },
     "trainer": {
-        "epochs": 100,
+        "epochs": 10,
 
         "save_dir": "saved/",
         "save_period": 1,
         "verbosity": 2,
         
         "monitor": "min val_loss",
-        "early_stop": 10,
+        "early_stop": 5,
 
         "tensorboard": true
     }
