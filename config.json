@@ -5,13 +5,13 @@
     "arch": {
         "type": "WaveNetModel",
         "args": {
-            "n_layers": 3,
+            "n_layers": 4,
             "n_blocks": 2,
             "n_dilation_channels": 32,
             "n_residual_channels": 32,
-            "n_skip_channels": 256,
+            "n_skip_channels": 32,
             "n_end_channels": 2,
-            "n_classes": 2,
+            "n_classes": 256,
             "output_length": 1,
             "kernel_size": 2,
             "bias": true
@@ -20,10 +20,8 @@
     "data_loader": {
         "type": "MobilityDataLoader",
         "args":{
-            "data_dir": "data/wavenet_mobility.parquet",
-            "item_length": 14,
-            "target_length": 3,
-            "batch_size": 16,
+            "data_dir": "data",
+            "batch_size": 32,
             "shuffle": true,
             "validation_split": 0.1,
             "num_workers": 8
@@ -39,7 +37,7 @@
     },
     "loss": "MSELoss",
     "metrics": [
-        "rmse_loss", "haversine"
+        "rmse_loss"
     ],
     "lr_scheduler": {
         "type": "StepLR",
@@ -49,7 +47,7 @@
         }
     },
     "trainer": {
-        "epochs": 10,
+        "epochs": 50,
 
         "save_dir": "saved/",
         "save_period": 1,
