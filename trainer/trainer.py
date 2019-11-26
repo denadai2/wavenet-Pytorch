@@ -28,6 +28,9 @@ class Trainer(BaseTrainer):
         self.train_metrics = MetricTracker('loss', *[m.__name__ for m in self.metric_ftns], writer=self.writer)
         self.valid_metrics = MetricTracker('loss', *[m.__name__ for m in self.metric_ftns], writer=self.writer)
 
+        # Fix for Residual stack
+        self.model.res_blocks.to_device(self.device)
+
     def _train_epoch(self, epoch):
         """
         Training logic for an epoch
@@ -35,13 +38,14 @@ class Trainer(BaseTrainer):
         :param epoch: Integer, current training epoch.
         :return: A log that contains average loss and metric in this epoch.
         """
+        print("Receipt field", self.model.receptive_field)
         self.model.train()
         self.train_metrics.reset()
         for batch_idx, (data, target) in enumerate(self.data_loader):
-            data, target = data.to(self.device), target.to(self.device)
+            data, target = data.to(self.device),  target.to(self.device)
 
             self.optimizer.zero_grad()
-            output = self.model(data)
+            output = self.model(data, None)
             loss = self.criterion(output, target)
             loss.backward()
             self.optimizer.step()
@@ -82,7 +86,7 @@ class Trainer(BaseTrainer):
             for batch_idx, (data, target) in enumerate(self.valid_data_loader):
                 data, target = data.to(self.device), target.to(self.device)
 
-                output = self.model(data)
+                output = self.model(data, None)
                 loss = self.criterion(output, target)
 
                 self.writer.set_step((epoch - 1) * len(self.valid_data_loader) + batch_idx, 'valid')
@@ -91,8 +95,8 @@ class Trainer(BaseTrainer):
                     self.valid_metrics.update(met.__name__, met(output, target))
 
         # add histogram of model parameters to the tensorboard
-        for name, p in self.model.named_parameters():
-            self.writer.add_histogram(name, p, bins='auto')
+        #for name, p in self.model.named_parameters():
+        #    self.writer.add_histogram(name, p, bins='auto')
         return self.valid_metrics.result()
 
     def _progress(self, batch_idx):
