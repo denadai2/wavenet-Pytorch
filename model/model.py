@@ -16,6 +16,7 @@ class WaveNetModel(BaseModel):
                  n_classes=256,
                  output_length=32,
                  kernel_size=2,
+                 global_conditioning=None,
                  bias=False):
         super().__init__()
 
@@ -28,65 +29,53 @@ class WaveNetModel(BaseModel):
         self.n_end_channels = n_end_channels
         self.n_classes = n_classes
         self.kernel_size = kernel_size
+        self.output_length = output_length
+        self.global_conditioning = global_conditioning
 
         # build model
         self.receptive_field = self.calc_receptive_fields(self.n_layers, self.n_blocks)
 
         # 1x1 convolution to create channels
-        self.causal = CausalConv1d(self.n_classes, self.n_residual_channels, kernel_size=kernel_size, bias=bias)
+        self.causal = nn.Conv1d(self.n_classes, self.n_residual_channels, kernel_size=1, bias=bias)
 
         # Residual block
         self.res_blocks = ResidualStack(self.n_layers,
                                         self.n_blocks,
                                         self.n_residual_channels,
-                                        self.n_classes,
+                                        self.n_dilation_channels,
+                                        self.n_skip_channels,
                                         self.kernel_size,
+                                        self.global_conditioning,
                                         bias)
 
         self.end_net = nn.Sequential(
             nn.ReLU(inplace=True),
-            nn.Conv1d(self.n_classes, self.n_end_channels, kernel_size=1, bias=bias),
+            nn.Conv1d(self.n_skip_channels, self.n_end_channels, kernel_size=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv1d(self.n_end_channels, self.n_end_channels, kernel_size=1, bias=bias)
+            nn.Conv1d(self.n_end_channels, self.n_classes, kernel_size=1, bias=True)
         )
 
         self.output_length = output_length
 
-    def forward(self, input):
+    def forward(self, input, global_condition=None):
         x = self.causal(input)
-        skip_connections = self.res_blocks(x, self.output_length)
+        skip_connections = self.res_blocks(x, self.output_length, global_condition)
         output = torch.sum(skip_connections, dim=0)
         output = self.end_net(output)
-
+        output = self.regression(output.view(output.size(0), -1)).view(output.size(0), 2, -1)
         return output
 
     @staticmethod
     def calc_receptive_fields(layer_size, stack_size):
-        # TODO: check
-        layers = [2 ** i for i in range(0, layer_size)] * stack_size
-        num_receptive_fields = np.sum(layers)
+        num_receptive_fields = 2 ** layer_size * stack_size
 
         return int(num_receptive_fields)
 
 
-class CausalConv1d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=2, bias=False):
-        super(CausalConv1d, self).__init__()
-
-        self.conv = nn.Conv1d(in_channels, out_channels,
-                              kernel_size=kernel_size,
-                              stride=1, padding=1,
-                              bias=bias)
-
-    def forward(self, x):
-        output = self.conv(x)
-
-        # remove last value for causal convolution! (It should not use the last value to not mix train and test)
-        return output[:, :, :-self.conv.padding[0]]
-
-
-class ResidualStack(torch.nn.Module):
-    def __init__(self, layer_size, stack_size, res_channels, skip_channels, kernel_size=2, bias=False):
+class ResidualStack(BaseModel):
+    def __init__(self, layer_size, stack_size, res_channels, dil_channels, skip_channels, kernel_size=2,
+                 global_conditioning=None, bias=False,
+                 device=None):
         """
         Stack residual blocks by layer and stack size
         :param layer_size: integer, 10 = layer[dilation=1, dilation=2, 4, 8, 16, 32, 64, 128, 256, 512]
@@ -99,8 +88,10 @@ class ResidualStack(torch.nn.Module):
 
         self.layer_size = layer_size
         self.stack_size = stack_size
+        self.device = device
 
-        self.res_blocks = self.stack_res_block(res_channels, skip_channels, kernel_size, bias)
+        self.res_blocks = nn.ModuleList(
+            self.stack_res_block(res_channels, dil_channels, skip_channels, kernel_size, global_conditioning, bias))
 
     def build_dilations(self):
         dilations = []
@@ -113,7 +104,7 @@ class ResidualStack(torch.nn.Module):
 
         return dilations
 
-    def stack_res_block(self, res_channels, skip_channels, kernel_size, bias):
+    def stack_res_block(self, res_channels, dil_channels, skip_channels, kernel_size, global_conditioning, bias):
         """
         Prepare dilated convolution blocks by layer and stack size
         """
@@ -122,14 +113,16 @@ class ResidualStack(torch.nn.Module):
 
         for d in dilations:
             res_blocks.append(ResidualBlock(res_channels,
+                                            dil_channels,
                                             skip_channels,
                                             d,
                                             kernel_size=kernel_size,
+                                            global_conditioning=global_conditioning,
                                             bias=bias))
 
         return res_blocks
 
-    def forward(self, x, skip_size):
+    def forward(self, x, skip_size, global_condition=None):
         """
         :param x: Input for the operation
         :param skip_size: The last output size for loss and prediction
@@ -138,17 +131,25 @@ class ResidualStack(torch.nn.Module):
         output = x
         skip_connections = []
 
-        for res_block in self.res_blocks:
-            # output is the next input
-            output, skip = res_block(output, skip_size)
+        for i in range(len(self.build_dilations())):
+            output, skip = self.res_blocks[i](output, skip_size, global_condition)
             skip_connections.append(skip)
 
         return torch.stack(skip_connections)
 
+    def to_device(self, device):
 
-class ResidualBlock(torch.nn.Module):
+        for i, _ in enumerate(self.res_blocks):
+            self.res_blocks[i].to(device)
 
-    def __init__(self, res_channels: int, skip_channels, dilation, kernel_size, bias=False):
+        # if torch.cuda.device_count() > 1:
+        #    block = torch.nn.DataParallel(block)
+
+
+class ResidualBlock(BaseModel):
+
+    def __init__(self, res_channels: int, dil_channels, skip_channels, dilation, kernel_size, global_conditioning=None,
+                 bias=False):
         """
         Thanks to https://github.com/golbin/WaveNet
 
@@ -160,30 +161,44 @@ class ResidualBlock(torch.nn.Module):
         """
         super(ResidualBlock, self).__init__()
 
-        self.dilated = DilatedCausalConv1d(res_channels, dilation=dilation, kernel_size=kernel_size, bias=bias)
-        self.conv_res = torch.nn.Conv1d(res_channels, res_channels, 1, bias=bias)
-        self.conv_skip = torch.nn.Conv1d(res_channels, skip_channels, 1, bias=bias)
+        self.global_conditioning = global_conditioning
+
+        self.dilated_tanh = DilatedCausalConv1d(res_channels, dil_channels, dilation=dilation, kernel_size=kernel_size,
+                                                bias=bias)
+        self.dilated_sigmoid = DilatedCausalConv1d(res_channels, dil_channels, dilation=dilation,
+                                                   kernel_size=kernel_size,
+                                                   bias=bias)
+        self.conv_res = torch.nn.Conv1d(dil_channels, res_channels, 1, bias=bias)
+        self.conv_skip = torch.nn.Conv1d(dil_channels, skip_channels, 1, bias=bias)
+
+        self.globalc_weight = None
+        if self.global_conditioning:
+            self.globalc_weight_tanh = nn.Linear(self.global_conditioning[0], self.global_conditioning[1], bias=False)
+            self.globalc_weight_sigmoid = nn.Linear(self.global_conditioning[0], self.global_conditioning[1],
+                                                    bias=False)
 
         self.gate_tanh = torch.nn.Tanh()
         self.gate_sigmoid = torch.nn.Sigmoid()
 
-    def forward(self, x, skip_size):
+    def forward(self, x, skip_size, global_condition=None):
         """
         :param x: Input of the residual block
         :param skip_size: The last output size for loss and prediction
         :return:
         """
-        output = self.dilated(x)
+        output_tanh = self.dilated_tanh(x)
+        output_sigmoid = self.dilated_sigmoid(x)
+        if self.global_conditioning:
+            output_tanh = output_tanh + self.globalc_weight_tanh(global_condition)
+            output_sigmoid = output_sigmoid + self.globalc_weight_sigmoid(global_condition)
 
-        # PixelCNN gate
-        gated_tanh = self.gate_tanh(output)
-        gated_sigmoid = self.gate_sigmoid(output)
+        gated_tanh = self.gate_tanh(output_tanh)
+        gated_sigmoid = self.gate_sigmoid(output_sigmoid)
         gated = gated_tanh * gated_sigmoid
 
-        # Residual network
         output = self.conv_res(gated)
         input_cut = x[:, :, -output.size(2):]
-        output += input_cut
+        output = output + input_cut
 
         # Skip connection
         skip = self.conv_skip(gated)
@@ -194,7 +209,8 @@ class ResidualBlock(torch.nn.Module):
 
 class DilatedCausalConv1d(torch.nn.Module):
     """Dilated Causal Convolution for WaveNet """
-    def __init__(self, channels, kernel_size=2, dilation=1, bias=False):
+
+    def __init__(self, in_channels, out_channels, kernel_size=2, dilation=1, bias=False):
         """
         Thanks to https://github.com/golbin/WaveNet
 
@@ -205,16 +221,19 @@ class DilatedCausalConv1d(torch.nn.Module):
         """
         super(DilatedCausalConv1d, self).__init__()
 
-        pad = (kernel_size - 1) * dilation
+        self.padding = (kernel_size - 1) * dilation
 
-        self.conv = torch.nn.Conv1d(channels, channels,
+        self.conv = torch.nn.Conv1d(in_channels, out_channels,
                                     kernel_size=kernel_size,
                                     stride=1,  # Fixed for WaveNet
                                     dilation=dilation,
-                                    padding=pad,
+                                    padding=self.padding,
                                     bias=bias)
 
     def forward(self, x):
         output = self.conv(x)
+
+        if self.padding == 0:
+            return output
 
         return output[:, :, :-self.conv.padding[0]]
